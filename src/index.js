@@ -7,6 +7,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestWaWebVersion,
+  jidNormalizedUser,
 } = require("@whiskeysockets/baileys");
 
 const P = require("pino");
@@ -23,6 +24,13 @@ const {
   listNotGoing,
   resetEvent,
 } = require("./db");
+
+const {
+  INACTIVITY_THRESHOLD_DAYS,
+  recordActivity,
+  seedMembers,
+  getInactiveParticipants,
+} = require("./activity");
 
 const {
   buildConvocation,
@@ -42,14 +50,25 @@ const ALLOWED_GROUP_JID = "120363428768217690@g.us";
 // IDENTIFICAR USUARIO
 // ============================================================
 
+// Normaliza un identificador de WhatsApp quitando sufijos de
+// dispositivo/agente y unificando el servidor (@lid o @s.whatsapp.net).
+// Devuelve null si el valor no es un JID válido.
+function normalizeId(value) {
+  if (!value || typeof value !== "string") return null;
+
+  const normalized = jidNormalizedUser(value);
+
+  return normalized || null;
+}
+
 function getParticipantId(participant) {
   if (!participant) return null;
 
   if (typeof participant === "string") {
-    return participant;
+    return normalizeId(participant);
   }
 
-  return (
+  return normalizeId(
     participant.id ||
     participant.lid ||
     participant.jid ||
@@ -58,12 +77,35 @@ function getParticipantId(participant) {
   );
 }
 
+// Un participante del grupo puede ser referenciado tanto por su LID
+// como por su número de teléfono. Devolvemos TODOS sus identificadores
+// conocidos (ya normalizados y sin duplicados) para poder cruzarlo
+// contra los registros sin importar en qué formato se guardaron.
+function getParticipantIdentifiers(participant) {
+  if (!participant || typeof participant !== "object") return [];
+
+  const ids = [
+    participant.id,
+    participant.jid,
+    participant.lid,
+    participant.phoneNumber,
+  ]
+    .map(normalizeId)
+    .filter(Boolean);
+
+  return [...new Set(ids)];
+}
+
 function getUserId(message) {
   const key = message.key || {};
 
+  // key.participantAlt no existe en Baileys. Los identificadores reales
+  // del emisor en un mensaje de grupo son participant / participantPn /
+  // participantLid.
   const participant =
     key.participant ||
-    key.participantAlt ||
+    key.participantPn ||
+    key.participantLid ||
     null;
 
   return getParticipantId(participant);
@@ -328,25 +370,43 @@ async function commandConfirmar(sock, message, event) {
     const registrations =
       listRegistrations(event.id);
 
+    // Existe una fila por cada persona que respondió (haya dicho
+    // !voy o !novoy). Normalizamos por si hay registros antiguos
+    // guardados sin normalizar.
     const registered = new Set(
-      registrations.map(
-        (registration) =>
-          registration.phone
-      )
+      registrations
+        .map((registration) =>
+          normalizeId(registration.phone)
+        )
+        .filter(Boolean)
     );
 
-    const pending =
-      participants.filter(
-        (participant) => {
-          const id =
-            getParticipantId(participant);
+    // Identificadores del propio bot, para no auto-mencionarse.
+    const selfIds = new Set(
+      [sock.user?.id, sock.user?.lid]
+        .map(normalizeId)
+        .filter(Boolean)
+    );
 
-          return (
-            id &&
-            !registered.has(id)
-          );
-        }
-      );
+    const pending = participants.filter((participant) => {
+      const ids = getParticipantIdentifiers(participant);
+
+      if (!ids.length) {
+        return false;
+      }
+
+      // Es el propio bot.
+      if (ids.some((id) => selfIds.has(id))) {
+        return false;
+      }
+
+      // Ya respondió (con cualquiera de sus identificadores).
+      if (ids.some((id) => registered.has(id))) {
+        return false;
+      }
+
+      return true;
+    });
 
     if (!pending.length) {
       await sock.sendMessage(
@@ -363,6 +423,8 @@ async function commandConfirmar(sock, message, event) {
       return;
     }
 
+    // Para la mención usamos el id con el que WhatsApp direcciona
+    // el grupo (participant.id), así la notificación llega bien.
     const mentions =
       pending
         .map((participant) =>
@@ -397,6 +459,21 @@ async function commandConfirmar(sock, message, event) {
     );
 
     console.error(error);
+
+    try {
+      await sock.sendMessage(
+        ALLOWED_GROUP_JID,
+        {
+          text:
+            "❌ No se pudo generar la lista de pendientes. Probá de nuevo en unos segundos.",
+        },
+        {
+          quoted: message,
+        }
+      );
+    } catch (_) {
+      // Si tampoco se puede avisar del error, no hacemos nada más.
+    }
   }
 }
 
@@ -493,6 +570,139 @@ async function commandReiniciar(sock, message) {
       "❌ Error reiniciando evento:",
       error
     );
+  }
+}
+
+// ============================================================
+// CONTROL DE INACTIVIDAD
+// ============================================================
+//
+// Registro y detección de miembros inactivos. Es un sistema
+// aparte de las inscripciones a eventos: sólo mira quién envió
+// mensajes al grupo y cuándo. Todavía NO elimina a nadie.
+// ============================================================
+
+// Identificadores del propio bot (para excluirlo siempre).
+function getSelfIds(sock) {
+  return new Set(
+    [sock.user?.id, sock.user?.lid]
+      .map(normalizeId)
+      .filter(Boolean)
+  );
+}
+
+function isAdminParticipant(participant) {
+  return (
+    participant.admin === "admin" ||
+    participant.admin === "superadmin"
+  );
+}
+
+// Devuelve los participantes inactivos del grupo y cuántos días
+// llevan sin enviar mensajes. Excluye siempre a administradores
+// y al propio bot.
+async function findInactiveParticipants(sock, options = {}) {
+  const participants = await getGroupParticipants(sock);
+
+  const selfIds = getSelfIds(sock);
+
+  const members = participants
+    .filter((participant) => !isAdminParticipant(participant))
+    .map((participant) => ({
+      id: getParticipantId(participant),
+      identifiers: getParticipantIdentifiers(participant),
+    }))
+    .filter((member) => {
+      if (!member.id) {
+        return false;
+      }
+
+      // Es el propio bot.
+      return !member.identifiers.some((id) => selfIds.has(id));
+    });
+
+  return getInactiveParticipants(
+    ALLOWED_GROUP_JID,
+    members,
+    options
+  );
+}
+
+// Registra la actividad del emisor de un mensaje del grupo.
+function trackMessageActivity(message) {
+  if (message.key?.fromMe) {
+    return;
+  }
+
+  const senderId = getUserId(message);
+
+  if (!senderId) {
+    return;
+  }
+
+  recordActivity(
+    ALLOWED_GROUP_JID,
+    senderId,
+    message.messageTimestamp
+  );
+}
+
+// ============================================================
+// COMANDO !INACTIVOS
+// ============================================================
+
+async function commandInactivos(sock, message) {
+  try {
+    const inactive = await findInactiveParticipants(sock);
+
+    if (!inactive.length) {
+      await sock.sendMessage(
+        ALLOWED_GROUP_JID,
+        {
+          text:
+            `✅ No hay miembros inactivos ` +
+            `(sin mensajes hace ${INACTIVITY_THRESHOLD_DAYS}+ días).`,
+        },
+        {
+          quoted: message,
+        }
+      );
+
+      return;
+    }
+
+    const mentions = inactive.map((item) => item.id);
+
+    let text =
+      `😴 MIEMBROS INACTIVOS ` +
+      `(${INACTIVITY_THRESHOLD_DAYS}+ días sin mensajes)\n\n`;
+
+    inactive.forEach((item) => {
+      const dias =
+        item.inactiveDays === null
+          ? "sin registro"
+          : `${item.inactiveDays} días`;
+
+      text += `😴 @${item.id.split("@")[0]} — ${dias}\n`;
+    });
+
+    text += `\n👥 TOTAL: ${inactive.length}`;
+    text += `\n\nℹ️ Detección solamente: no se elimina a nadie.`;
+
+    await sock.sendMessage(
+      ALLOWED_GROUP_JID,
+      {
+        text,
+        mentions,
+      },
+      {
+        quoted: message,
+      }
+    );
+
+  } catch (error) {
+    console.error("❌ Error en !inactivos:");
+    console.error(error);
   }
 }
 
@@ -614,6 +824,15 @@ async function processCommand(
         );
 
         break;
+
+    case "!inactivos":
+
+      await commandInactivos(
+        sock,
+        message
+      );
+
+      break;
 
 
     default:
@@ -776,6 +995,30 @@ async function startBot() {
         console.log(
           "🤖 Bot listo para recibir comandos."
         );
+
+        // Sembrar el control de inactividad: a los miembros
+        // actuales sin registro previo les marcamos "ahora"
+        // como última actividad, para que la ventana de
+        // inactividad empiece a contar desde este momento.
+        try {
+          const participants = await getGroupParticipants(sock);
+
+          const ids = participants
+            .map((participant) => getParticipantId(participant))
+            .filter(Boolean);
+
+          seedMembers(ALLOWED_GROUP_JID, ids);
+
+          console.log(
+            `🗓️ Control de inactividad listo (${ids.length} miembros).`
+          );
+        } catch (error) {
+          console.error(
+            "⚠️ No se pudo sembrar el control de inactividad:"
+          );
+
+          console.error(error);
+        }
       }
 
       if (
@@ -916,6 +1159,14 @@ async function startBot() {
           console.log(
             "✅ Mensaje pertenece al grupo correcto."
           );
+
+          // --------------------------------------------------
+          // REGISTRAR ACTIVIDAD DEL EMISOR
+          // --------------------------------------------------
+          // Independiente de la lógica de eventos: sólo anota
+          // que esta persona envió un mensaje y cuándo.
+
+          trackMessageActivity(message);
 
           // --------------------------------------------------
           // OBTENER TEXTO

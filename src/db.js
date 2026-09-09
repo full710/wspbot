@@ -292,6 +292,7 @@ function resetEvent(chatJid, eventDate, eventTime, gatherTime) {
 // ============================================================
 
 module.exports = {
+  db,
   getActiveEvent,
   createEvent,
   setMessageId,
